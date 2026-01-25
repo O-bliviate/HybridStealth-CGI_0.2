@@ -25,14 +25,14 @@ class Arguments:
         self.model_path = './model'
 
         # === 联邦学习基础配置 ===
-        self.num_clients = 100  # [合并] 更新为 100 (Config的值)
+        self.num_clients = 50  # [合并] 更新为 100 (Config的值)
         self.batch_size = 4  # 客户端本地训练 BatchSize
         self.num_dummy = 1  # 攻击重建时的 BatchSize
-        self.iteration = 2000  # 攻击迭代次数 (或 FL 轮次，视具体逻辑)
+        self.iteration = 1000  # 攻击迭代次数 (或 FL 轮次，视具体逻辑)
         self.lr = 0.01  # [合并] 更新为 0.01 (FL 学习率)
 
         # === 网络与优化器 ===
-        self.net = 'resnet20-4'  # 'lenet', 'resnet20-4', 'resnet34', 'vgg11'
+        self.net = 'lenet'  # 'lenet', 'resnet20-4', 'resnet34', 'vgg11'
         self.net_mt_diff = True
         self.optim = 'Adam'
         self.scheduler = False
