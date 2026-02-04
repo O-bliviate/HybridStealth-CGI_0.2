@@ -2,142 +2,125 @@ from loguru import logger
 import torch
 import torch.nn.functional as F
 import arguments
-import os  # [新增] 用于路径操作
-import torchvision  # [新增] 用于保存图像
+import os
+import torchvision
+import pretrain_pmm  # [恢复] 必须导入
 
-# 导入各层模块
 from datasets import get_dataloader
 from federated_core import FederatedServer, LocalUpdate
 from pmm_modules import MaliciousModel, inject_fingerprint
 from attack_phase1_parsing import Phase1Parser
 from attack_phase2_nash import Phase2Inverter
-# 引入新的评估模块
 from metrics import Evaluator, compute_feature_metrics
 
 
 def main():
-    # 1. 初始化配置与环境
     args = arguments.Arguments(logger)
     args.log()
-    logger.info(f"Initializing HybridStealth-CGI on device: {args.device}...")
 
-    # 2. 准备数据与模型
+    # 0. 自动执行元学习 (Meta-Learning)
+    weight_path = os.path.join(args.root_path, 'model_weights', 'pmm_weights.pth')
+    if not os.path.exists(weight_path):
+        logger.warning("⚠️ Training PMM from scratch (Meta-Learning)...")
+        # 这会调用带有 Non-IID 数据的训练脚本
+        pretrain_pmm.train_pmm()
+
+    # 1. 环境准备
     tt, dst, idx_shuffle, num_classes = get_dataloader(args)
-    global_model = MaliciousModel(num_classes, device=args.device).to(args.device)
+    # 加载刚刚训练好的权重
+    global_model = MaliciousModel(num_classes, device=args.device, root_path=args.root_path).to(args.device)
 
-    # 初始化专业评估器 (加载 LPIPS)
     evaluator = Evaluator(args.device)
-
-    # 3. 初始化联邦组件
     server = FederatedServer()
     gt_data_list = []
 
-    logger.info(f"Simulating FL with {args.num_clients} clients...")
+    logger.info(f"Experiment: {args.num_clients} Clients, Scale={args.target_scale}")
 
-    # 4. 联邦训练循环
+    # 2. 联邦训练
     for i in range(args.num_clients):
-        # A. 准备数据
         curr_idx = idx_shuffle[i]
         gt_img = tt(dst[curr_idx][0]).float().to(args.device).unsqueeze(0)
         gt_label = torch.tensor([dst[curr_idx][1]]).long().to(args.device)
         gt_data_list.append(gt_img)
 
-        # B. 注入指纹
-        inject_fingerprint(global_model, i, args.num_clients)
+        # 注入目标 (设置 C)
+        inject_fingerprint(global_model, i, args.num_clients, args.target_scale)
 
-        # C. 本地训练
         client = LocalUpdate(args, global_model, F.cross_entropy)
         grads = client.train(gt_img, gt_label)
-
-        # D. 安全聚合
         server.secure_aggregate(grads)
 
-        if (i + 1) % 20 == 0:
-            logger.info(f"Processed Client {i + 1}/{args.num_clients}")
+        if (i + 1) % 10 == 0: logger.info(f"Client {i + 1} Training Completed.")
 
-    # 获取 PMM 梯度
     agg_grads = server.get_aggregated_gradients()
     try:
         pmm_grad = agg_grads['pmm.linear.weight']
     except KeyError:
         pmm_grad = agg_grads['pmm.weight']
 
-    # 5. 攻击引擎启动
+    # 3. 攻击阶段
     logger.info("Starting Attack Engine...")
-    parser = Phase1Parser(global_model.pmm.target_matrix, args.device)
-    inverter = Phase2Inverter(global_model, args)
+    # [新增] 传入 scaler 参数
+    parser = Phase1Parser(
+        global_model.pmm.target_matrix,
+        global_model.pmm.scaler_mean,
+        global_model.pmm.scaler_std,
+        args.device
+    )
+    inverter = Phase2Inverter(global_model, args)  # 内部包含 LBFGS + Nash
 
-    # 准备保存图像的目录 [新增]
     save_dir = os.path.join(args.root_path, 'results', 'reconstructions')
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    logger.info(f"Reconstructed images will be saved to: {save_dir}")
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
 
-    # 统计容器
-    stats = {
-        'ph1_cos': 0, 'ph1_mse': 0,
-        'ph2_psnr': 0, 'ph2_ssim': 0, 'ph2_lpips': 0
-    }
-    success = 0
+    print("\n" + "=" * 165)
+    print(
+        f"{'ID':<3} | {'Ph1 Feature':<11} | {'Phase 1 (LBFGS Init)':<24} | {'Phase 2 (Nash Final)':<24} | {'Improvement':<26}")
+    print(
+        f"{'':<3} | {'Cos Sim':<11} | {'PSNR':<6} {'SSIM':<8} {'LPIPS':<6} | {'PSNR':<6} {'SSIM':<8} {'LPIPS':<6} | {'d_PSNR':<8} {'d_SSIM':<8} {'d_LPIPS':<6}")
+    print("-" * 165)
 
-    # 打印表头
-    print(f"\n{'ID':<4} | {'Ph1 Cos':<10} | {'Ph2 PSNR':<10} | {'Ph2 SSIM':<10} | {'Ph2 LPIPS':<10}")
-    print("-" * 55)
+    stats = {'ph2_psnr': 0, 'ph2_ssim': 0}
 
     for i in range(args.num_clients):
-        # --- 准备 Ground Truth Feature 用于 Phase 1 评估 ---
         with torch.no_grad():
             _, _, gt_feat = global_model(gt_data_list[i])
-            gt_feat = gt_feat.squeeze(0)  # [512]
+            gt_feat = gt_feat.squeeze(0)
 
-        # --- Phase 1: 解析 ---
-        feat_recovered = parser.parse(pmm_grad, i, args.num_clients)
+        # Phase 1: 解析
+        global_model.pmm.set_target_for_client(i, args.target_scale)
+        parser.target_matrix = global_model.pmm.target_matrix
 
-        # Phase 1 评估
-        ph1_metrics = compute_feature_metrics(feat_recovered, gt_feat)
-        stats['ph1_cos'] += ph1_metrics['cos']
-        stats['ph1_mse'] += ph1_metrics['mse']
+        total_scale = args.batch_size * args.local_epochs
+        feat_recovered = parser.parse(pmm_grad, i, total_scale)
 
-        # --- Phase 2: 反演 ---
-        img_recon = inverter.invert(feat_recovered)
+        ph1_feat = compute_feature_metrics(feat_recovered, gt_feat)
 
-        # --- Phase 2: 评估 ---
-        ph2_metrics = evaluator.compute_img_metrics(img_recon, gt_data_list[i])
+        # Phase 2 (LBFGS + Nash)
+        img_init, img_final = inverter.invert(feat_recovered)
 
-        stats['ph2_psnr'] += ph2_metrics['psnr']
-        stats['ph2_ssim'] += ph2_metrics['ssim']
-        stats['ph2_lpips'] += ph2_metrics['lpips']
+        ph1_img = evaluator.compute_img_metrics(img_init, gt_data_list[i])
+        ph2_img = evaluator.compute_img_metrics(img_final, gt_data_list[i])
 
-        if ph2_metrics['ssim'] > 0.6:
-            success += 1
+        stats['ph2_psnr'] += ph2_img['psnr']
+        stats['ph2_ssim'] += ph2_img['ssim']
 
-        # --- [新增] 保存对比图像 ---
-        # 拼接 Ground Truth 和 Reconstructed Image (左右排列)
-        # 注意：数据已经过 Normalize，save_image 的 normalize=True 会将其自动映射回 0-1 可视化范围
-        comparison = torch.cat([gt_data_list[i], img_recon], dim=0)
-        save_path = os.path.join(save_dir, f'client_{i}.png')
-        torchvision.utils.save_image(comparison, save_path, nrow=2, normalize=True, value_range=(-2.5, 2.5))
+        d_psnr = ph2_img['psnr'] - ph1_img['psnr']
+        d_ssim = ph2_img['ssim'] - ph1_img['ssim']
+        d_lpips = ph2_img['lpips'] - ph1_img['lpips']
 
-        # 实时打印
-        if (i + 1) % 10 == 0:
-            print(
-                f"{i:<4} | {ph1_metrics['cos']:<10.4f} | {ph2_metrics['psnr']:<10.2f} | {ph2_metrics['ssim']:<10.3f} | {ph2_metrics['lpips']:<10.3f}")
+        print(f"{i:<3} | {ph1_feat['cos']:<11.4f} | "
+              f"{ph1_img['psnr']:<6.2f} {ph1_img['ssim']:<8.3f} {ph1_img['lpips']:<6.3f} | "
+              f"{ph2_img['psnr']:<6.2f} {ph2_img['ssim']:<8.3f} {ph2_img['lpips']:<6.3f} | "
+              f"{d_psnr:<+8.2f} {d_ssim:<+8.3f} {d_lpips:<+6.3f}")
 
-    # 6. 最终报告
+        comparison = torch.cat([gt_data_list[i], img_init, img_final], dim=0)
+        torchvision.utils.save_image(comparison, os.path.join(save_dir, f'client_{i}.png'), nrow=3, normalize=True,
+                                     value_range=(-2.5, 2.5))
+
     n = args.num_clients
-    logger.info("-" * 30)
-    logger.info(f"FINAL RESULTS (N={n})")
-    logger.info(f"Phase 1 Avg Cosine Sim: {stats['ph1_cos'] / n:.4f}  (Target > 0.9)")
-    logger.info(f"Phase 2 Avg PSNR:       {stats['ph2_psnr'] / n:.2f} dB")
-    logger.info(f"Phase 2 Avg SSIM:       {stats['ph2_ssim'] / n:.4f}")
-    logger.info(f"Phase 2 Avg LPIPS:      {stats['ph2_lpips'] / n:.4f} (Lower is better)")
-    logger.info(f"Leakage Rate (SSIM>0.6): {(success / n) * 100:.2f}%")
-    logger.info(f"Check images at: {save_dir}")
+    logger.info("=" * 60)
+    logger.info(f"Avg SSIM: {stats['ph2_ssim'] / n:.4f} | Avg PSNR: {stats['ph2_psnr'] / n:.2f}")
 
 
 if __name__ == '__main__':
-    if torch.cuda.is_available():
-        print(f"CUDA: {torch.cuda.get_device_name(0)}")
-    else:
-        print("Using CPU")
     main()
